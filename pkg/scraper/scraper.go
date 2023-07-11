@@ -8,9 +8,9 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/ffuf/ffuf/v2/pkg/ffuf"
-
 	"github.com/PuerkitoBio/goquery"
+
+	"github.com/ffuf/ffuf/v2/pkg/ffuf"
 )
 
 type ScraperRule struct {

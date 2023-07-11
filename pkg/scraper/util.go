@@ -2,8 +2,9 @@ package scraper
 
 import (
 	"fmt"
-	"github.com/ffuf/ffuf/v2/pkg/ffuf"
 	"strings"
+
+	"github.com/ffuf/ffuf/v2/pkg/ffuf"
 )
 
 func headerString(headers map[string][]string) string {

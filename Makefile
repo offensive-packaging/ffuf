@@ -1,30 +1,168 @@
-BINARY_NAME=ffuf
+BOLD := $(shell tput -T linux bold)
+PURPLE := $(shell tput -T linux setaf 5)
+GREEN := $(shell tput -T linux setaf 2)
+CYAN := $(shell tput -T linux setaf 6)
+RED := $(shell tput -T linux setaf 1)
+RESET := $(shell tput -T linux sgr0)
+TITLE := $(BOLD)$(PURPLE)
+SUCCESS := $(BOLD)$(GREEN)
 
-build:
- GOARCH=amd64 GOOS=darwin go build -o ${BINARY_NAME}-darwin main.go
- GOARCH=amd64 GOOS=linux go build -o ${BINARY_NAME}-linux main.go
- GOARCH=amd64 GOOS=windows go build -o ${BINARY_NAME}-windows main.go
+BIN = ffuf
+TEMPDIR = ./.tmp
+RESULTSDIR = test/results
+GOIMPORTS_CMD = $(TEMPDIR)/gosimports -local github.com/ffuf
+# the quality gate lower threshold for unit test total % coverage (by function statements)
+COVERAGE_THRESHOLD := 50
+# CI cache busting values; change these if you want CI to not use previous stored cache
 
-run: build
- ./${BINARY_NAME}
+## Build variables
+DISTDIR=./dist
+SNAPSHOTDIR=./snapshot
+GITTREESTATE=$(if $(shell git status --porcelain),dirty,clean)
+OS := $(shell uname)
 
-clean:
- go clean
- rm ${BINARY_NAME}-darwin
- rm ${BINARY_NAME}-linux
- rm ${BINARY_NAME}-windows
+ifeq ($(OS),Darwin)
+	SNAPSHOT_CMD=$(shell realpath $(shell pwd)/$(SNAPSHOTDIR)/$(BIN)-macos_darwin_amd64/$(BIN))
+else
+	SNAPSHOT_CMD=$(shell realpath $(shell pwd)/$(SNAPSHOTDIR)/$(BIN)_linux_amd64/$(BIN))
+endif
 
-test:
- go test ./...
+ifeq "$(strip $(VERSION))" ""
+ override VERSION = $(shell git describe --always --tags --dirty)
+endif
 
-test_coverage:
- go test ./... -coverprofile=coverage.out
+## Variable assertions
 
-dep:
- go mod download
+ifndef TEMPDIR
+	$(error TEMPDIR is not set)
+endif
 
-vet:
- go vet
+ifndef RESULTSDIR
+	$(error RESULTSDIR is not set)
+endif
 
-lint:
- golangci-lint run --enable-all
+ifndef DISTDIR
+	$(error DISTDIR is not set)
+endif
+
+ifndef SNAPSHOTDIR
+	$(error SNAPSHOTDIR is not set)
+endif
+
+ifndef REF_NAME
+	REF_NAME = $(VERSION)
+endif
+
+define title
+    @printf '$(TITLE)$(1)$(RESET)\n'
+endef
+
+## Tasks
+
+.PHONY: all
+all: clean static-analysis test ## Run all linux-based checks
+	@printf '$(SUCCESS)All checks pass!$(RESET)\n'
+
+
+.PHONY: ci-bootstrap
+ci-bootstrap:
+	DEBIAN_FRONTEND=noninteractive sudo apt update && sudo -E apt install -y bc jq libxml2-utils
+
+$(RESULTSDIR):
+	mkdir -p $(RESULTSDIR)
+
+$(TEMPDIR):
+	mkdir -p $(TEMPDIR)
+
+.PHONY: bootstrap-tools
+bootstrap-tools: $(TEMPDIR)
+	GO111MODULE=off GOBIN=$(shell realpath $(TEMPDIR)) go get -u golang.org/x/perf/cmd/benchstat
+	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(TEMPDIR)/ v1.47.2
+	# we purposefully use the latest version of ffuf released
+	curl -sSfL https://raw.githubusercontent.com/offensive-packaging/ffuf/master/install.sh | sh -s -- -b $(TEMPDIR)/ v0.6.0
+	.github/scripts/goreleaser-install.sh -b $(TEMPDIR)/ v0.182.1
+	# the only difference between goimports and gosimports is that gosimports removes extra whitespace between import blocks (see https://github.com/golang/go/issues/20818)
+	GOBIN="$(shell realpath $(TEMPDIR))" go install github.com/rinchsan/gosimports/cmd/gosimports@v0.1.5
+
+.PHONY: bootstrap-go
+bootstrap-go:
+	go mod download
+
+.PHONY: bootstrap
+bootstrap: $(RESULTSDIR) bootstrap-go bootstrap-tools ## Download and install all go dependencies (+ prep tooling in the ./tmp dir)
+	$(call title,Bootstrapping dependencies)
+
+.PHONY: static-analysis
+static-analysis: check-go-mod-tidy
+
+.PHONY: format
+format: ## Auto-format all source code
+	$(call title,Running formatters)
+	gofmt -w -s .
+	$(GOIMPORTS_CMD) -w .
+	go mod tidy
+
+check-go-mod-tidy:
+	@ .github/scripts/go-mod-tidy-check.sh && echo "go.mod and go.sum are tidy!"
+
+.PHONY: build
+build: $(SNAPSHOTDIR) ## Build release snapshot binaries and packages
+
+$(SNAPSHOTDIR): ## Build snapshot release binaries and packages
+	$(call title,Building snapshot artifacts)
+	# create a config with the dist dir overridden
+	echo "dist: $(SNAPSHOTDIR)" > $(TEMPDIR).goreleaser.yml
+	cat .goreleaser.yml >> $(TEMPDIR).goreleaser.yml
+
+	# build release snapshots
+	BUILD_GIT_TREE_STATE=$(GITTREESTATE) \
+	$(TEMPDIR)/goreleaser build --snapshot --skip-validate --rm-dist --config $(TEMPDIR).goreleaser.yml
+
+.PHONY: changelog
+changelog: clean-changelog CHANGELOG.md
+	@docker run -it --rm \
+		-v $(shell pwd)/CHANGELOG.md:/CHANGELOG.md \
+		rawkode/mdv \
+			-t 748.5989 \
+			/CHANGELOG.md
+
+CHANGELOG.md:
+	$(TEMPDIR)/ffuf > CHANGELOG.md
+
+.PHONY: release
+release: clean-dist CHANGELOG.md ## Build and publish final binaries and packages.
+	$(call title,Publishing release artifacts)
+
+	# create a config with the dist dir overridden
+	echo "dist: $(DISTDIR)" > $(TEMPDIR).goreleaser.yml
+	cat .goreleaser.yml >> $(TEMPDIR).goreleaser.yml
+
+	# TODO: in the future add ffuf to generate changelogs
+	# release (note the version transformation from v0.7.0 --> 0.7.0)
+	bash -c "\
+		BUILD_GIT_TREE_STATE=$(GITTREESTATE) \
+		VERSION=$(VERSION:v%=%) \
+		$(TEMPDIR)/goreleaser \
+			--rm-dist \
+			--config $(TEMPDIR).goreleaser.yml  \
+			--release-notes <(cat CHANGELOG.md)"
+
+.PHONY: clean
+clean: clean-dist clean-snapshot  ## Remove previous builds, result reports, and test cache
+	rm -rf $(RESULTSDIR)/*
+
+.PHONY: clean-snapshot
+clean-snapshot:
+	rm -rf $(SNAPSHOTDIR) $(TEMPDIR).goreleaser.yml
+
+.PHONY: clean-dist
+clean-dist: clean-changelog
+	rm -rf $(DISTDIR) $(TEMPDIR).goreleaser.yml
+
+.PHONY: clean-changelog
+clean-changelog:
+	rm -f CHANGELOG.md
+
+.PHONY: help
+help:
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "$(BOLD)$(CYAN)%-25s$(RESET)%s\n", $$1, $$2}'
